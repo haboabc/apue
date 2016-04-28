@@ -1,0 +1,147 @@
+
+
+类UNIX信号以前是专为进程设计的，它比线程的出现早了很多年。当线程模型出现后，专家们试图也在线程上实现信号，这导致了一个问题：如果要在线程模型中保持原来在进程中信号语意不变，是相当困难的。
+
+避免信号和线程一起使用是明智的选择。但是，将他们分开又是不可能或不实际的。只要有可能的话，仅仅在主线程内使用pthread_sigmask()来屏蔽信号，然后同步地在专用线程中使用sigwait()来处理信号。
+
+ 
+
+为了理解信号模型是怎样映射到线程模型的，我们需要知道信号模型的哪些方面是影响进程层面的（process-wide），哪些方面只会影响某个线程的。下面列出几点:
+
+1.signal actions 是process-wide。如果一个没有处理的信号的默认动作是停止SIGSTOP或终止SIGKILL(该动作是让整个进程停止或终止，而不是只针对某个线程)，那么不管这个信号是发送给哪个线程，整个进程都会停止或终止。
+
+2.signal dispositions信号部署是process-wide。一个进程中的所有线程对某个信号都共享相同的信号处理函数。如果线程A使用sigaction()对某个信号，比如SIGINT，建立了一个信号处理函数。那么当SIGINT发送到线程B时，信号处理函数也会被调用。
+
+3.下面几种情况，把信号发送到某个指定的线程。
+
+       A..某个特定硬件指令执行后（在该线程内执行的），产生的信号，将会发送到该线程内。比如SIGBUS，SIGFPE，SIGILL，SIGSEGV。
+
+       B.当线程尝试向一个broken pipe写数据时，会产生一个SIGPIPE.
+
+       C.使用pthread_kill()或者pthread_sigqueue()。这些函数允许一个线程发送信号到另一个线程（同一进程中）。
+
+其他情况都是把信号发送到整个进程（比如，kill()和sigqueue()）。
+
+4.当一个信号被发送到一个多线程的进程中（注意是发送到进程）。内核会选择该进程中的
+
+任意线程来处理该信号。这种做法是为了保持进程中信号的语意，保证不会在多线程进程中一个信号多次被执行。
+
+5.信号掩码(signal mask)是线程私用的。在多线程的进程中，不存在process-wide的信号掩码。线程可以使用pthread_sigmask()来独立的屏蔽某些信号。通过这种方法，程序员可以控制那些线程响应那些信号。当线程被创建时，它将继承创建它的线程的信号掩码
+
+6.内核为每个线程和进程分别维护了一个未决信号的表。当使用sigpending()时，该函数返回的是整个进程未决信号表和调用该函数的线程的未决信号表的并集。当新线程被创建时，线程的pending signals被设置为空。当线程A阻塞某个信号S后，发送到A中的信号S将会被挂起，直到线程取消了对信号S的阻塞。
+
+7.如果一个信号处理函数打断了pthread_mutex_lock()，该函数会自动的重新执行。如果信号处理函数打断了pthread_cond_wait()（参见POSIX线程-条件变量），该函数要么自动重新自行（linux是这样实现的），或者返回0（这时应用要检查返回值，判断是否为假唤醒）。
+
+8.可选的信号栈是线程私有的（将会在线程总结时讨论）。新创建的线程不会继承创建它的线程的信号栈。
+
+ 
+
+信号掩码的操作
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldest)
+
+注意点：
+
+1.当新线程创建后，它将继承创建它的线程的信号掩码。
+
+2.pthread_sigmask()和sigprocmask()在linux上的实现是一样的。但是在SUSv3标准中规定：在多线程程序中使用sigprocmask()，结果是不定的，这会多程序的可移植性造成影响。
+
+ 
+
+发送信号到线程
+
+int pthread_kill(pthread_t thread, int sig)
+
+int pthread_sigqueue(pthread_t thread, int sig, const union sigval value)
+
+注意点：
+
+1.pthread_kill()函数在底层使用的是tgkill系统调用。
+
+2.pthread_sigqueue()函数是在glibc-2.11时加入的。它要求linux2.6.31，因为该版本提供了rt_tgsigqueueinfo()系统调用的。
+
+ 
+
+异步信号的处理
+
+一个函数要么是可重入的（reentrant）,要么是不能被信号处理函数打断的，我们把这种函数叫做是async-signal-safe的（在信号的总结中讨论）。调用非async-signal-safe的函数是危险的，比如，考虑在线程A中，我们调用malloc()来进行内存分配，malloc()刚用互斥量锁住了全局链表，这是异步信号到达，在信号处理函数中也调用malloc()，这时该函数会阻塞在互斥量上，形成死锁（这个例子在单线程的进程中也会出现）。Pthread API不是async-signal-safe的，也就是说在信号处理函数中不要使用pthread相关的函数。
+
+ 
+
+解决这个问题的最好办法是，在不打断正常程序的前提下，把所有的异步信号都在同一处处理。在单线程程序中，这是做不到的，因为所有发送的信号都会打断程序。而在多线程程序中，我们可以单独创建一个线程来接受信号，处理需要的信号，而不会打断其他线程的工作。
+
+ 
+
+上面举的这个例子中还有一点没说到，就是信号处理函数也会被其他信号所打断。那我们怎么处理这个问题呢？在处理信号之前，对所有的异步信号进行阻塞，等工作处理完毕后，再恢复阻塞的信号。这个工作就靠下面这个函数执行：
+
+int sigwait(const sigset_t *set, int *sig)
+
+（可能会被其他信号打断）
+
+注意点：
+
+1.调用sigwait()等待的信号必须在调用线程中屏蔽，通常我们在所有线程中都会屏蔽。
+
+2.信号仅仅被交付一次。如果两个线程在sigwait()上阻塞，只有一个线程（不确定的线程）将收到送给进程的信号。这意味着不能让两个独立的子系统使用sigwait()来捕获相同的信号。
+
+使用方法：
+
+在主线程中：
+
+    sigset_t signal_set;
+
+    sigemptyset(&signal_set)
+
+    sigfillset(&signal_set);
+
+    pthread_sigmask(SIG_BLOCK, &signal_set, NULL)
+
+    pthread_create();
+
+专门处理信号的线程（响应SIGINT）
+
+    sigset_t signal_set;
+
+    int sig_num;
+
+    sigemptyset(&signal_set);
+
+    sigaddset(&signal_set, SIGINT);
+
+    while(1){
+
+           sigwait(&signal_set, &sig_num);
+
+           if (sig_num == SIGINT)
+
+                  /*do some thing*/
+
+                  /*这里可以调用非asyn-signal-safe的函数*/
+
+    }
+
+注意信号处理函数是安全的！
+
+ 
+
+ 
+
+线程和exec()
+当在线程中调用exec()时，该线程被完全的被替代，线程ID不确定。除了被替代的线程，其他线程都被销毁。线程的thread-specific data销毁函数和清除函数都不会被调用。所有进程的互斥量和条件变量消失。
+
+ 
+
+线程和fork()
+
+当在多线程进程中调用fork()，只有调用fork()的线程被复制到子进程（子进程中线程的ID）。注意以下情况：
+
+1.虽然只有调用fork()的线程被复制到子进程，但是子进程的全局变量，互斥量，条件变量的状态都将和在父进程中的一样。也就是说，如果它在父进程中被锁住，则它在子进程中也是被锁住的。
+
+2. thread-specific data的销毁函数和清除函数都不会被调用。在多线程中调用fork()可能会引起内存泄露。比如在其他线程中创建的thread-specific data，在子进程中将没有指针来存取这些数据，造成内存泄露。
+
+因为以上这些问题，在线程中调用fork()的后，我们通常都会在子进程中调用exec()。因为exec()能让父进程中的所有互斥量，条件变量（pthread objects）在子进程中统统消失（用新数据覆盖所有的内存）。对于那些要使用fork()但不使用exec()的程序，pthread API提供了一个新的函数
+
+pthread_atfor(void (*prepare_func)(void), void(*parent_func)(void), void (*child_func)(void))
+
+prepare_func在父进程调用fork之前调用，parent_func在fork执行后在父进程内被调用，child_func在fork执行后子进程内被调用。除非你打算很快的exec一个新程序，否则应该避免在一个多线程的程序中使用fork—POSIX多线程程序设计-chapter6.2。
+
