@@ -1,3 +1,4 @@
+/* in liunx alarm() doesn't conflict against sleep() ?*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
